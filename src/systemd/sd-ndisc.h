@@ -67,6 +67,8 @@ int sd_ndisc_get_mtu(sd_ndisc *nd, uint32_t *mtu);
 int sd_ndisc_stop(sd_ndisc *nd);
 int sd_ndisc_router_discovery_start(sd_ndisc *nd);
 
+int sd_ndisc_router_advertisment_start(sd_ndisc *nd);
+
 #define SD_NDISC_ADDRESS_FORMAT_STR "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x"
 
 #define SD_NDISC_ADDRESS_FORMAT_VAL(address) \

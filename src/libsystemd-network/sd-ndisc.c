@@ -43,6 +43,7 @@ enum NDiscState {
         NDISC_STATE_IDLE,
         NDISC_STATE_SOLICITATION_SENT,
         NDISC_STATE_ADVERTISMENT_LISTEN,
+        NDISC_STATE_SOLICITATION_LISTEN,
         _NDISC_STATE_MAX,
         _NDISC_STATE_INVALID = -1,
 };
@@ -69,6 +70,7 @@ struct NDiscPrefix {
         uint8_t len;
         usec_t valid_until;
         struct in6_addr addr;
+        struct in6_addr solicit_addr;
 };
 
 struct sd_ndisc {
@@ -651,6 +653,125 @@ static int ndisc_router_solicitation_timeout(sd_event_source *s, uint64_t usec, 
         return 0;
 }
 
+static int ndisc_send_send_router_advertisment(sd_ndisc *nd, in6_addr *host)
+{
+        return -EOPNOTSUPP;
+}
+
+static int ndisc_router_advertisment_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
+        const struct inaddr_any = IN6ADDR_ANY_INIT;
+        sd_ndisc *nd = userdata;
+        uint64_t time_now, next_timeout;
+        int r;
+
+        assert(s);
+        assert(nd);
+        assert(nd->event);
+
+        nd->timeout = sd_event_source_unref(nd->timeout);
+
+        r = ndisc_send_router_advertisment(nd, &inaddr_any);
+        if (r < 0)
+                ndisc_log(nd, "Could not send RA to %s", strna(&inaddr_any));
+
+        return 0;
+}
+
+static int ndisc_router_solicitation_recv(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_free_ struct nd_router_solicit *rs = NULL;
+        sd_ndisc *nd = userdata;
+        union {
+                struct cmsghdr cmsghdr;
+                uint8_t buf[CMSG_LEN(sizeof(int))];
+        } control = {};
+        struct iovec iov = {};
+        union sockaddr_union sa = {};
+        struct msghdr msg = {
+                .msg_name = &sa.sa,
+                .msg_namelen = sizeof(sa),
+                .msg_iov = &iov,
+                .msg_iovlen = 1,
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
+        };
+        struct cmsghdr *cmsg;
+        struct in6_addr *host;
+
+        assert(s);
+        assert(nd);
+        assert(nd->event);
+
+        r = ioctl(fd, FIONREAD, &buflen);
+        if (r < 0)
+                return -errno;
+        else if (buflen < 0)
+                /* This really should not happen */
+                return -EIO;
+
+        iov.iov_len = buflen;
+
+        rs = malloc(iov.iov_len);
+        if (!rs)
+                return -ENOMEM;
+
+        iov.iov_base = rs;
+
+        len = recvmsg(fd, &msg, 0);
+        if (len < 0) {
+                if (errno == EAGAIN || errno == EINTR)
+                        return 0;
+
+                log_ndisc(nd, "Could not receive message from ICMPv6 socket: %m");
+                return -errno;
+        } else if ((size_t)len < sizeof(struct nd_router_advert)) {
+                return 0;
+        } else if (msg.msg_namelen == 0)
+                host = NULL; /* only happens when running the test-suite over a socketpair */
+        else if (msg.msg_namelen != sizeof(sa.in6)) {
+                log_ndisc(nd, "Received invalid source address size from ICMPv6 socket: %zu bytes", (size_t)msg.msg_namelen);
+                return 0;
+        } else
+                host = &sa.in6.sin6_addr;
+
+        assert(!(msg.msg_flags & MSG_CTRUNC));
+        assert(!(msg.msg_flags & MSG_TRUNC));
+
+        CMSG_FOREACH(cmsg, &msg) {
+                if (cmsg->cmsg_level == SOL_IPV6 &&
+                    cmsg->cmsg_type == IPV6_HOPLIMIT &&
+                    cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
+                        int hops = *(int*)CMSG_DATA(cmsg);
+
+                        if (hops != 255) {
+                                log_ndisc(nd, "Received RA with invalid hop limit %d. Ignoring.", hops);
+                                return 0;
+                        }
+
+                        break;
+                }
+        }
+
+        if (host && !in_addr_is_link_local(AF_INET6, (const union in_addr_union*) gw)) {
+                _cleanup_free_ char *addr = NULL;
+
+                (void)in_addr_to_string(AF_INET6, (const union in_addr_union*) host, &addr);
+
+                log_ndisc(nd, "Received RS from non-link-local address %s. Ignoring.", strna(addr));
+                return 0;
+        }
+
+        if (rs->nd_rs_type != ND_ROUTER_SOLICIT)
+                return 0;
+
+        if (rs->nd_rs_code != 0)
+                return 0;
+
+        log_ndisc(nd, "Received RS from %s", strna(host));
+
+        ndisc_send_send_router_advertisment(nd, host);
+        return 0;
+}
+
 int sd_ndisc_stop(sd_ndisc *nd) {
         assert_return(nd, -EINVAL);
         assert_return(nd->event, -EINVAL);
@@ -666,6 +787,7 @@ int sd_ndisc_stop(sd_ndisc *nd) {
 
         return 0;
 }
+
 
 int sd_ndisc_router_discovery_start(sd_ndisc *nd) {
         int r;
@@ -713,6 +835,64 @@ error:
                 ndisc_init(nd);
         else
                 log_ndisc(client, "Start Router Solicitation");
+
+        return r;
+}
+
+int sd_ndisc_router_advertisment_start(sd_ndisc *nd)
+{
+        int r;
+
+        assert(nd);
+        assert(nd->event);
+
+        if (nd->state != NDISC_STATE_IDLE)
+                return -EBUSY;
+
+        if (nd->index < 1)
+                return -EINVAL;
+
+        if (nd->prefixes == NULL)
+                return -EINVAL;
+
+        if (IN6_IS_ADDR_UNSPECIFIED(&nd->addr))
+                return -EINVAL;
+
+        r = icmp6_bind_router_solicitation(nd->index);
+        if (r < 0)
+                return r;
+
+        nd->fd = r;
+
+        r = sd_event_add_io(nd->event, &nd->recv, nd->fd, EPOLLIN,
+                            ndisc_router_solicitation_recv, nd);
+        if (r < 0)
+                goto error;
+
+        r = sd_event_source_set_priority(nd->recv, nd->event_priority);
+        if (r < 0)
+                goto error;
+
+        r = sd_event_source_set_description(nd->recv, "ndisc-rs-receive-message");
+        if (r < 0)
+                goto error;
+
+        r = sd_event_add_time(nd->event, &nd->timeout, clock_boottime_or_monotonic(),
+                              0, 0, ndisc_router_advertisment_timeout, nd);
+        if (r < 0)
+                goto error;
+
+        r = sd_event_source_set_priority(nd->timeout, nd->event_priority);
+        if (r < 0)
+                goto error;
+
+        r = sd_event_source_set_description(nd->timeout, "ndisc-ra-timeout");
+error:
+        if (r < 0)
+                ndisc_init(nd);
+        else
+                nd->state = NDISC_STATE_SOLICITATION_LISTEN;
+                log_ndisc(client, "Start Router Advertisment");
 
         return r;
 }
